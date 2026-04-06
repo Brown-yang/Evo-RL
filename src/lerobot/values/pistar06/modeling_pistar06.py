@@ -218,7 +218,10 @@ def _load_language_model(
     dtype: torch.dtype,
 ) -> nn.Module:
     if AutoConfig is None or AutoModelForCausalLM is None or AutoModel is None:
-        raise ImportError("transformers is not installed. Install with `pip install 'lerobot[pi0]'`.")
+        raise ImportError(
+            "transformers is not installed. Install with `pip install transformers` "
+            "or `pip install 'lerobot[transformers-dep]'`."
+        )
 
     model_config = AutoConfig.from_pretrained(repo_id, revision=revision)
     architectures = getattr(model_config, "architectures", None) or []
@@ -256,7 +259,10 @@ class Pistar06Model(nn.Module):
     def __init__(self, cfg: Pistar06Config):
         super().__init__()
         if AutoModel is None or AutoImageProcessor is None:
-            raise ImportError("transformers is not installed. Install with `pip install 'lerobot[pi0]'`.")
+            raise ImportError(
+                "transformers is not installed. Install with `pip install transformers` "
+                "or `pip install 'lerobot[transformers-dep]'`."
+            )
 
         self.cfg = cfg
         self.model_dtype = _resolve_load_dtype(cfg.dtype)

@@ -83,6 +83,7 @@ from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import make_default_processors
 from lerobot.processor.rename_processor import rename_stats
+import lerobot.robots.aubo_arm  # noqa: F401  # registers AuboArmConfig for CLI
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_openarm_follower,

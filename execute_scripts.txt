@@ -1,0 +1,26 @@
+cd /mydata/Evo-RL && \
+export HF_HUB_CACHE=/mydata/hub && \
+export HF_HUB_OFFLINE=1 && \
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+lerobot-train \
+  --dataset.repo_id=local/episodes_no_depth_no_left_wrist_abs \
+  --dataset.root=/mydata/datasets/episodes_no_depth_no_left_wrist_v30_abs \
+  --policy.path=/mydata/models/pi0.5_base/ \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --policy.compile_model=false \
+  --policy.gradient_checkpointing=true \
+  --policy.train_expert_only=true \
+  --policy.tokenizer_max_length=128 \
+  --batch_size=1 \
+  --num_workers=1 \
+  --steps=30000 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator_pistar06 \
+  --acp.indicator_dropout_prob=0.3 \
+  --rename_map='{"observation.images.head": "observation.images.base_0_rgb", "observation.images.right_wrist": "observati
+on.images.right_wrist_0_rgb"}' \
+  --output_dir=outputs/train/acp_policy_pistar06_lowmem \
+  --job_name=acp_policy_pistar06_lowmem \
+  --wandb.enable=false \
+  --policy.push_to_hub=false
