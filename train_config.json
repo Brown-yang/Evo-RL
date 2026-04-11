@@ -1,0 +1,24 @@
+{
+  "dataset": {
+    "repo_id": "local/libero_10_no_noops_1.0.0_lerobot",
+    "root": "/mydata/LIBERO/libero_10_no_noops_1.0.0_lerobot"
+  },
+  "output_dir": "outputs/train/pi05_lora_libero10",
+  "job_name": "pi05_lora_libero10",
+  "steps": 30000,
+  "batch_size": 8,
+  "num_workers": 1,
+  "log_freq": 200,
+  "save_freq": 5000,
+  "peft": {
+    "method_type": "LORA",
+    "r": 64
+  },
+  "wandb": {
+    "enable": false
+  },
+  "rename_map": {
+    "observation.images.image": "observation.images.base_0_rgb",
+    "observation.images.wrist_image": "observation.images.left_wrist_0_rgb"
+  }
+}
