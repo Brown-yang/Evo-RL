@@ -34,6 +34,18 @@ TRAIN_CONFIG_NAME = "train_config.json"
 
 
 @dataclass
+class EHPLConfig:
+    enable: bool = False
+    pairs_parquet: str | None = None
+    beta: float = 1.0
+    stats_json: str | None = None
+    task_index_to_instruction_json: str | None = None
+    hf_home: str | None = None
+    offline: bool = False
+    monkeypatch_openpi_compat: bool = True
+
+
+@dataclass
 class ACPConfig:
     enable: bool = False
     indicator_field: str = "complementary_info.acp_indicator"
@@ -74,6 +86,7 @@ class TrainPipelineConfig(HubMixin):
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
     acp: ACPConfig = field(default_factory=ACPConfig)
+    ehpl: EHPLConfig = field(default_factory=EHPLConfig)
 
     # RA-BC (Reward-Aligned Behavior Cloning) parameters
     use_rabc: bool = False  # Enable reward-weighted training
@@ -152,6 +165,25 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError("'acp.indicator_dropout_prob' must be within [0, 1].")
         if self.acp.enable and not self.acp.indicator_field:
             raise ValueError("'acp.indicator_field' must be set when 'acp.enable=true'.")
+
+        # EHPL validation
+        if self.ehpl.enable:
+            if not self.dataset.root:
+                raise ValueError("ehpl.enable=true requires `dataset.root` pointing to a v2.1 lerobot dataset.")
+            if not self.ehpl.pairs_parquet:
+                raise ValueError("ehpl.enable=true requires `ehpl.pairs_parquet` (P2 pairs parquet path).")
+            if self.policy.type not in ("pi0", "pi05"):
+                raise ValueError(
+                    f"EHPL is only supported for pi0/pi05 policies, got '{self.policy.type}'."
+                )
+            if self.acp.enable:
+                raise ValueError("EHPL and ACP cannot be enabled at the same time.")
+            if self.use_rabc:
+                raise ValueError("EHPL and RA-BC cannot be enabled at the same time.")
+            if self.resume:
+                raise ValueError("EHPL does not support resume yet.")
+            if self.dataset.streaming:
+                raise ValueError("EHPL does not support streaming datasets.")
 
         if self.use_rabc and not self.rabc_progress_path:
             # Auto-detect from dataset path

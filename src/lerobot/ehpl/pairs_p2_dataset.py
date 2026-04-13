@@ -14,10 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EHPL Pairs P2 Dataset for v2.1 `*_lerobot` layouts."""
+"""EHPL Pairs P2 Dataset — supports both v2.1 and v3.0 lerobot layouts."""
 
 from __future__ import annotations
 
+import io
+import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,9 +28,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 
 from lerobot.utils.constants import ACTION
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -44,20 +50,25 @@ class EhplP2Sample:
 
 
 class EhplPairsP2Dataset(Dataset):
-    """Preference pairs dataset (P2 layout) for v2.1 `*_lerobot` datasets (parquet-per-episode + mp4-per-episode).
+    """Preference pairs dataset (P2 layout) supporting v2.1 and v3.0 lerobot datasets.
 
-    This dataset format is what we observed in `libero_10_no_noops_1.0.0_lerobot`:
-    - parquet: `data/chunk-000/episode_{episode_index:06d}.parquet`
-    - videos: `videos/chunk-000/{video_key}/episode_{episode_index:06d}.mp4`
+    v2.1 layout (parquet-per-episode + mp4-per-episode):
+    - parquet: ``data/chunk-000/episode_{episode_index:06d}.parquet``
+    - videos:  ``videos/chunk-000/{video_key}/episode_{episode_index:06d}.mp4``
+
+    v3.0 layout (shared parquet files + inline images):
+    - parquet: ``data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet``
+    - images stored as ``{'bytes': ..., 'path': ...}`` dicts inside the parquet
+    - ``video_path`` in info.json is ``null``
 
     Each item returns the observation at the segment start (single-frame):
-    - `observation.images.image`, `observation.images.wrist_image`: float32 CHW in [0, 1]
-    - `observation.state`: float32 (8,)
-    - `index`, `episode_index`, `frame_index`, `task_index`
-    - `task` (optional): instruction string if `task_index_to_instruction` is provided
+    - ``observation.images.image``, ``observation.images.wrist_image``: float32 CHW in [0, 1]
+    - ``observation.state``: float32 (8,)
+    - ``index``, ``episode_index``, ``frame_index``, ``task_index``
+    - ``task`` (optional): instruction string if ``task_index_to_instruction`` is provided
     plus EHPL fields:
-    - `action_w`, `action_l`: preferred/rejected action sequences [H, act_dim]
-    - `action_mask`: uint8 mask [H]
+    - ``action_w``, ``action_l``: preferred/rejected action sequences [H, act_dim]
+    - ``action_mask``: uint8 mask [H]
     """
 
     def __init__(
@@ -70,18 +81,39 @@ class EhplPairsP2Dataset(Dataset):
         super().__init__()
         self.dataset_root = str(dataset_root)
         self.pairs_parquet = str(pairs_parquet)
-        self.task_index_to_instruction = task_index_to_instruction
         self.device = device
 
         info_path = Path(dataset_root) / "meta" / "info.json"
         if not info_path.exists():
-            raise FileNotFoundError("Expected v2.1 dataset meta at " + str(info_path))
+            raise FileNotFoundError("Expected dataset meta at " + str(info_path))
 
         self.info = json_load(info_path)
         self.fps = int(self.info.get("fps", 20))
+        self.codebase_version = self.info.get("codebase_version", "v2.1")
 
-        self.data_path_tpl = str(Path(dataset_root) / "data" / "chunk-000" / "episode_{episode_index:06d}.parquet")
-        self.video_path_tpl = str(Path(dataset_root) / "videos" / "chunk-000" / "{video_key}" / "episode_{episode_index:06d}.mp4")
+        # Load task instructions from tasks.parquet if available
+        if task_index_to_instruction is None:
+            tasks_path = Path(dataset_root) / "meta" / "tasks.parquet"
+            if tasks_path.exists():
+                tasks_df = pd.read_parquet(str(tasks_path), engine="pyarrow")
+                # tasks.parquet has task text as index and task_index as column
+                self.task_index_to_instruction = {}
+                for task_text, row in tasks_df.iterrows():
+                    self.task_index_to_instruction[int(row["task_index"])] = str(task_text)
+                logger.info(f"Auto-loaded {len(self.task_index_to_instruction)} tasks from {tasks_path}")
+            else:
+                self.task_index_to_instruction = None
+        else:
+            self.task_index_to_instruction = task_index_to_instruction
+
+        # Detect layout version
+        self._is_v3 = self.codebase_version.startswith("v3")
+        if self._is_v3:
+            logger.info("Detected v3.0 dataset layout (inline images in parquet)")
+            self._init_v3()
+        else:
+            logger.info("Detected v2.1 dataset layout (per-episode parquet + mp4)")
+            self._init_v21()
 
         # Load pairs parquet
         self.pairs = pd.read_parquet(pairs_parquet, engine="pyarrow")
@@ -111,6 +143,40 @@ class EhplPairsP2Dataset(Dataset):
         if not (self.pairs["act_dim"].astype(int) == self.act_dim).all():
             raise ValueError("pairs parquet has non-constant act_dim; keep fixed per run.")
 
+    # ------------------------------------------------------------------ #
+    # v2.1 init — per-episode parquet + mp4 videos
+    # ------------------------------------------------------------------ #
+    def _init_v21(self) -> None:
+        self.data_path_tpl = str(
+            Path(self.dataset_root) / "data" / "chunk-000" / "episode_{episode_index:06d}.parquet"
+        )
+        self.video_path_tpl = str(
+            Path(self.dataset_root) / "videos" / "chunk-000" / "{video_key}" / "episode_{episode_index:06d}.mp4"
+        )
+
+    # ------------------------------------------------------------------ #
+    # v3.0 init — shared file-*.parquet with inline images
+    # ------------------------------------------------------------------ #
+    def _init_v3(self) -> None:
+        """Build an episode→file mapping by scanning parquet files."""
+        data_dir = Path(self.dataset_root) / "data" / "chunk-000"
+        self._ep_to_file: dict[int, Path] = {}
+        for pf in sorted(data_dir.glob("file-*.parquet")):
+            df_index = pd.read_parquet(pf, engine="pyarrow", columns=["episode_index"])
+            for ep in df_index["episode_index"].unique():
+                self._ep_to_file[int(ep)] = pf
+        logger.info(f"v3.0 episode→file mapping: {len(self._ep_to_file)} episodes across {len(set(self._ep_to_file.values()))} files")
+
+        # Detect image keys from info.json features
+        self._image_keys = [
+            k for k, v in self.info.get("features", {}).items()
+            if v.get("dtype") == "image"
+        ]
+        logger.info(f"v3.0 image keys: {self._image_keys}")
+
+    # ------------------------------------------------------------------ #
+    # __len__ / reshape helper
+    # ------------------------------------------------------------------ #
     def __len__(self) -> int:
         return int(len(self.pairs))
 
@@ -121,6 +187,9 @@ class EhplPairsP2Dataset(Dataset):
             raise ValueError(f"{name} expected length {exp} (=H*D), got {arr.size}")
         return torch.from_numpy(arr).reshape(self.h_seg, self.act_dim)
 
+    # ------------------------------------------------------------------ #
+    # __getitem__
+    # ------------------------------------------------------------------ #
     def __getitem__(self, i: int) -> dict[str, Any]:
         row = self.pairs.iloc[i]
         episode_index = int(row["episode_index"])
@@ -128,64 +197,16 @@ class EhplPairsP2Dataset(Dataset):
         task_index = int(row["task_index"])
         segment_start_index = int(row["segment_start_index"])
 
-        # Load episode parquet for observation data
-        ep_parquet = Path(self.dataset_root) / self.data_path_tpl.format(
-            episode_chunk=0, episode_index=episode_index
-        )
-        df = pd.read_parquet(
-            str(ep_parquet),
-            engine="pyarrow",
-            columns=(
-                "observation.state",
-                "timestamp",
-                "index",
-                "episode_index",
-                "frame_index",
-                "task_index",
-            ),
-        )
+        if self._is_v3:
+            item = self._load_obs_v3(episode_index, frame_index, task_index, segment_start_index)
+        else:
+            item = self._load_obs_v21(episode_index, frame_index, task_index, segment_start_index)
 
-        if frame_index >= len(df):
-            raise IndexError(f"frame_index={frame_index} out of range for episode {episode_index}")
-
-        # State
-        state = np.asarray(df.iloc[frame_index]["observation.state"], dtype=np.float32)
-        if state.shape != (8,):
-            raise ValueError(
-                f"Unexpected state shape {state.shape} at ep={episode_index} t={frame_index}"
-            )
-
-        # Decode images from video
-        image = decode_mp4_frame(
-            Path(self.video_path_tpl.format(
-                episode_chunk=0,
-                video_key="observation.images.image",
-                episode_index=episode_index,
-            )),
-            frame_index,
-        )
-        wrist = decode_mp4_frame(
-            Path(self.video_path_tpl.format(
-                episode_chunk=0,
-                video_key="observation.images.wrist_image",
-                episode_index=episode_index,
-            )),
-            frame_index,
-        )
-
-        item = {
-            "observation.state": torch.from_numpy(state),
-            "observation.images.image": image,
-            "observation.images.wrist_image": wrist,
-            "index": torch.tensor(segment_start_index, dtype=torch.int64),
-            "episode_index": torch.tensor(episode_index, dtype=torch.int64),
-            "frame_index": torch.tensor(frame_index, dtype=torch.int64),
-            "task_index": torch.tensor(task_index, dtype=torch.int64),
-        }
-
-        # Optional task instruction
+        # Task instruction (required by pi0.5 preprocessor)
         if self.task_index_to_instruction is not None:
             item["task"] = self.task_index_to_instruction.get(task_index, f"Task {task_index}")
+        else:
+            item["task"] = f"Task {task_index}"
 
         # EHPL action fields
         action_w = self._reshape_flat(row["action_w"], name="action_w")
@@ -209,9 +230,119 @@ class EhplPairsP2Dataset(Dataset):
 
         return item
 
+    # ------------------------------------------------------------------ #
+    # v2.1 observation loading
+    # ------------------------------------------------------------------ #
+    def _load_obs_v21(
+        self, episode_index: int, frame_index: int, task_index: int, segment_start_index: int
+    ) -> dict[str, Any]:
+        ep_parquet = self.data_path_tpl.format(episode_chunk=0, episode_index=episode_index)
+        df = pd.read_parquet(
+            ep_parquet,
+            engine="pyarrow",
+            columns=(
+                "observation.state",
+                "timestamp",
+                "index",
+                "episode_index",
+                "frame_index",
+                "task_index",
+            ),
+        )
 
-def json_load(path: str) -> dict[str, Any]:
-    import json
+        if frame_index >= len(df):
+            raise IndexError(f"frame_index={frame_index} out of range for episode {episode_index}")
+
+        state = np.asarray(df.iloc[frame_index]["observation.state"], dtype=np.float32)
+
+        # Decode images from video
+        image = decode_mp4_frame(
+            Path(self.video_path_tpl.format(
+                episode_chunk=0,
+                video_key="observation.images.image",
+                episode_index=episode_index,
+            )),
+            frame_index,
+        )
+        wrist = decode_mp4_frame(
+            Path(self.video_path_tpl.format(
+                episode_chunk=0,
+                video_key="observation.images.wrist_image",
+                episode_index=episode_index,
+            )),
+            frame_index,
+        )
+
+        return {
+            "observation.state": torch.from_numpy(state),
+            "observation.images.image": image,
+            "observation.images.wrist_image": wrist,
+            "index": torch.tensor(segment_start_index, dtype=torch.int64),
+            "episode_index": torch.tensor(episode_index, dtype=torch.int64),
+            "frame_index": torch.tensor(frame_index, dtype=torch.int64),
+            "task_index": torch.tensor(task_index, dtype=torch.int64),
+        }
+
+    # ------------------------------------------------------------------ #
+    # v3.0 observation loading
+    # ------------------------------------------------------------------ #
+    def _load_obs_v3(
+        self, episode_index: int, frame_index: int, task_index: int, segment_start_index: int
+    ) -> dict[str, Any]:
+        pf = self._ep_to_file.get(episode_index)
+        if pf is None:
+            raise FileNotFoundError(
+                f"No file found for episode_index={episode_index}. "
+                f"Available: {sorted(self._ep_to_file.keys())}"
+            )
+
+        # Read the relevant columns
+        cols = ["observation.state", "episode_index", "frame_index"] + self._image_keys
+        df = pd.read_parquet(str(pf), engine="pyarrow", columns=cols)
+
+        # Filter to the target episode and frame
+        ep_df = df[df["episode_index"] == episode_index].reset_index(drop=True)
+        if frame_index >= len(ep_df):
+            raise IndexError(
+                f"frame_index={frame_index} out of range for episode {episode_index} "
+                f"(file has {len(ep_df)} frames for this episode)"
+            )
+
+        frame_row = ep_df.iloc[frame_index]
+
+        state = np.array(frame_row["observation.state"], dtype=np.float32, copy=True)
+
+        item: dict[str, Any] = {
+            "observation.state": torch.from_numpy(state),
+            "index": torch.tensor(segment_start_index, dtype=torch.int64),
+            "episode_index": torch.tensor(episode_index, dtype=torch.int64),
+            "frame_index": torch.tensor(frame_index, dtype=torch.int64),
+            "task_index": torch.tensor(task_index, dtype=torch.int64),
+        }
+
+        # Decode inline images
+        for img_key in self._image_keys:
+            img_dict = frame_row[img_key]
+            if isinstance(img_dict, dict) and "bytes" in img_dict:
+                img_bytes = img_dict["bytes"]
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                arr = np.asarray(img, dtype=np.float32) / 255.0
+                # HWC -> CHW
+                item[img_key] = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+            else:
+                raise ValueError(
+                    f"Expected image dict with 'bytes' key for {img_key}, "
+                    f"got {type(img_dict)}"
+                )
+
+        return item
+
+
+# ------------------------------------------------------------------ #
+# Utilities
+# ------------------------------------------------------------------ #
+
+def json_load(path: str | Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 

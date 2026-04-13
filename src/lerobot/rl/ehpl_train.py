@@ -246,9 +246,18 @@ def update_policy_ehpl(
                 batch[k] = v.to(dev, non_blocking=True)
         return batch
 
+    # Determine the model's chunk_size so we can pad EHPL actions to match.
+    _unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    chunk_size = getattr(_unwrapped.config, "chunk_size", None)
+
     def _one_side(actions_key: str) -> torch.Tensor:
         b = dict(raw_batch)
-        b[ACTION] = raw_batch[actions_key]
+        actions = raw_batch[actions_key]
+        # Pad action time dimension from h_seg to chunk_size if needed
+        if chunk_size is not None and actions.shape[1] < chunk_size:
+            pad_len = chunk_size - actions.shape[1]
+            actions = F.pad(actions, (0, 0, 0, pad_len))  # pad last-but-one dim (time)
+        b[ACTION] = actions
         adapt_ehpl_image_keys_inplace(b, expected_image_keys)
         b = preprocessor(b)
         b = _move_to_device_inplace(b)

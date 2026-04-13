@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build EHPL P2 preference pairs from a v2.1 `*_lerobot` dataset.
+"""Build EHPL P2 preference pairs from a lerobot dataset (v2.1 or v3.0).
 
-Reads per-episode parquet files, segments trajectories at skill boundaries
+Reads episode data, segments trajectories at skill boundaries
 (gripper events + change-point detection), then constructs preference pairs
 by comparing expert segments against perturbed candidates.
 """
@@ -58,30 +58,16 @@ def _mad(x: np.ndarray) -> float:
     return float(np.median(np.abs(x - med))) + 1e-08
 
 
-def _load_episode_parquet(path: str) -> dict[str, Any]:
-    """Load an episode parquet and return state, action, and metadata arrays."""
-    df = pd.read_parquet(
-        path,
-        engine="pyarrow",
-        columns=(
-            "observation.state",
-            "action",
-            "timestamp",
-            "frame_index",
-            "episode_index",
-            "index",
-            "task_index",
-        ),
-    )
-
+def _load_episode_from_df(df: pd.DataFrame) -> dict[str, Any]:
+    """Convert a single-episode DataFrame into state, action, and metadata arrays."""
     state = np.stack([np.asarray(v, dtype=np.float32) for v in df["observation.state"].to_list()], axis=0)
     action = np.stack([np.asarray(v, dtype=np.float32) for v in df["action"].to_list()], axis=0)
 
     # Validate shapes
     if state.ndim != 2 or state.shape[1] != 8:
-        raise ValueError(f"Unexpected state shape {state.shape} in {path}")
+        raise ValueError(f"Unexpected state shape {state.shape}")
     if action.ndim != 2 or action.shape[1] != 7:
-        raise ValueError(f"Unexpected action shape {action.shape} in {path}")
+        raise ValueError(f"Unexpected action shape {action.shape}")
 
     out = {
         "state": state,
@@ -93,6 +79,57 @@ def _load_episode_parquet(path: str) -> dict[str, Any]:
         "task_index": int(df["task_index"].iloc[0]),
     }
     return out
+
+
+def _load_all_episodes(dataset_root: str, episode_start: int, episode_end: int) -> list[dict[str, Any]]:
+    """Load episodes from a lerobot dataset (v2.1 or v3.0)."""
+    root = Path(dataset_root)
+    info_path = root / "meta" / "info.json"
+    if info_path.exists():
+        with open(info_path, "r") as f:
+            info = json.load(f)
+    else:
+        info = {}
+
+    chunk_dir = root / "data" / "chunk-000"
+    if not chunk_dir.exists():
+        raise FileNotFoundError(f"Expected {chunk_dir} to exist")
+
+    parquet_files = sorted(chunk_dir.glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found under {chunk_dir}")
+
+    # Detect format: v3.0 uses file-*.parquet, v2.1 uses episode_*.parquet
+    first_name = parquet_files[0].name
+    is_v3 = first_name.startswith("file-")
+
+    cols = ("observation.state", "action", "timestamp", "frame_index", "episode_index", "index", "task_index")
+
+    episodes: list[dict[str, Any]] = []
+
+    if is_v3:
+        # v3.0: read all file-*.parquet, split by episode_index
+        print(f"Detected v3.0 layout, reading {len(parquet_files)} files...")
+        all_dfs = []
+        for pf in parquet_files:
+            df = pd.read_parquet(str(pf), engine="pyarrow", columns=list(cols))
+            all_dfs.append(df)
+        big_df = pd.concat(all_dfs, ignore_index=True)
+
+        for ep_idx in sorted(big_df["episode_index"].unique()):
+            ep_idx = int(ep_idx)
+            if ep_idx < episode_start or ep_idx >= episode_end:
+                continue
+            ep_df = big_df[big_df["episode_index"] == ep_idx].reset_index(drop=True)
+            episodes.append(_load_episode_from_df(ep_df))
+    else:
+        # v2.1: each file is one episode
+        print(f"Detected v2.1 layout, reading {len(parquet_files)} episode files...")
+        for p in parquet_files[episode_start:episode_end]:
+            df = pd.read_parquet(str(p), engine="pyarrow", columns=list(cols))
+            episodes.append(_load_episode_from_df(df))
+
+    return episodes
 
 
 def _compute_boundaries(state: np.ndarray, action: np.ndarray, cfg: P2Config) -> np.ndarray:
@@ -204,23 +241,24 @@ def build_pairs_for_dataset(
     episode_start: int = 0,
     episode_end_exclusive: int | None = None,
 ) -> None:
-    """Build preference pairs from a v2.1 lerobot dataset."""
+    """Build preference pairs from a lerobot dataset (v2.1 or v3.0)."""
     rng = np.random.default_rng(cfg.seed)
-    dataset_root_p = Path(dataset_root)
 
-    chunk_dir = dataset_root_p / "data" / "chunk-000"
-    if not chunk_dir.exists():
-        raise FileNotFoundError(f"Expected {chunk_dir} to exist")
+    # Determine episode range
+    info_path = Path(dataset_root) / "meta" / "info.json"
+    if info_path.exists():
+        with open(info_path, "r") as f:
+            info = json.load(f)
+        total_eps = info.get("total_episodes", 9999)
+    else:
+        total_eps = 9999
+    ep_end = min(total_eps, episode_end_exclusive) if episode_end_exclusive is not None else total_eps
 
-    episode_files = sorted([p for p in chunk_dir.iterdir() if p.name.endswith(".parquet")])
-    if not episode_files:
-        raise FileNotFoundError(f"No parquet episodes found under {chunk_dir}")
-
-    ep_end = min(len(episode_files), episode_end_exclusive) if episode_end_exclusive is not None else len(episode_files)
+    episodes = _load_all_episodes(dataset_root, episode_start, ep_end)
+    print(f"Loaded {len(episodes)} episodes (range [{episode_start}, {ep_end}))")
 
     rows = []
-    for p in episode_files[episode_start:ep_end]:
-        ep = _load_episode_parquet(str(p))
+    for ep in episodes:
         action = ep["action"]
         idx_abs = int(ep["index"][0])
         T = int(action.shape[0])

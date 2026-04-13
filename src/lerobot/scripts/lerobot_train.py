@@ -37,6 +37,16 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.acp_dataset_stats import compute_acp_indicator_stats
 from lerobot.rl.acp_hook import build_acp_raw_batch_hook
+from lerobot.rl.ehpl_train import (
+    adapt_ehpl_image_keys_inplace,
+    apply_ehpl_hf_env,
+    ehpl_collate_fn,
+    make_ehpl_train_dataset,
+    monkeypatch_gemma_gated_residual,
+    monkeypatch_gemma_rmsnorm_cond,
+    monkeypatch_siglip_check,
+    update_policy_ehpl,
+)
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -216,10 +226,27 @@ def train(
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
+    # EHPL mode: apply HF env, monkeypatches, and build EHPL dataset
+    use_ehpl = cfg.ehpl.enable
+    if use_ehpl:
+        apply_ehpl_hf_env(hf_home=cfg.ehpl.hf_home, offline=cfg.ehpl.offline)
+        if cfg.ehpl.monkeypatch_openpi_compat:
+            monkeypatch_siglip_check()
+            monkeypatch_gemma_rmsnorm_cond()
+            monkeypatch_gemma_gated_residual()
+        # Merge default rename_map for LIBERO v2.1 -> OpenPI camera keys
+        if "observation.images.image" not in cfg.rename_map:
+            cfg.rename_map["observation.images.image"] = "observation.images.base_0_rgb"
+        if "observation.images.wrist_image" not in cfg.rename_map:
+            cfg.rename_map["observation.images.wrist_image"] = "observation.images.left_wrist_0_rgb"
+
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
         logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
+        if use_ehpl:
+            dataset = make_ehpl_train_dataset(cfg)
+        else:
+            dataset = make_dataset(cfg)
         if cfg.acp.enable:
             indicator_stats = compute_acp_indicator_stats(dataset, cfg.acp.indicator_field)
             if indicator_stats is None:
@@ -255,7 +282,10 @@ def train(
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
-        dataset = make_dataset(cfg)
+        if use_ehpl:
+            dataset = make_ehpl_train_dataset(cfg)
+        else:
+            dataset = make_dataset(cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -373,7 +403,19 @@ def train(
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    if use_ehpl:
+        # EHPL uses its own collate_fn and does not use EpisodeAwareSampler
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            collate_fn=ehpl_collate_fn,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+    elif hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
@@ -386,16 +428,17 @@ def train(
         shuffle = True
         sampler = None
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
-    )
+    if not use_ehpl:
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=shuffle and not cfg.dataset.streaming,
+            sampler=sampler,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
@@ -439,12 +482,25 @@ def train(
         if key not in prompt_keys:
             prompt_keys.append(key)
 
+    # Resolve expected image keys for EHPL
+    ehpl_expected_image_keys: list[str] = []
+    if use_ehpl:
+        unwrapped = accelerator.unwrap_model(policy)
+        ehpl_expected_image_keys = list(
+            getattr(unwrapped.config, "image_features", {}).keys()
+        )
+
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        if acp_raw_batch_hook is not None:
-            batch = acp_raw_batch_hook(batch, step)
-        batch = preprocessor(batch)
+        if use_ehpl:
+            # EHPL path: do NOT apply global preprocessor here;
+            # update_policy_ehpl applies it internally per action branch.
+            pass
+        else:
+            if acp_raw_batch_hook is not None:
+                batch = acp_raw_batch_hook(batch, step)
+            batch = preprocessor(batch)
 
         if is_main_process and not logged_first_prompt:
             for key in prompt_keys:
@@ -464,16 +520,30 @@ def train(
                     break
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            rabc_weights_provider=rabc_weights,
-        )
+        if use_ehpl:
+            train_tracker, output_dict = update_policy_ehpl(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                cfg.optimizer.grad_clip_norm,
+                accelerator=accelerator,
+                preprocessor=preprocessor,
+                expected_image_keys=ehpl_expected_image_keys,
+                beta=cfg.ehpl.beta,
+                lr_scheduler=lr_scheduler,
+            )
+        else:
+            train_tracker, output_dict = update_policy(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                cfg.optimizer.grad_clip_norm,
+                accelerator=accelerator,
+                lr_scheduler=lr_scheduler,
+                rabc_weights_provider=rabc_weights,
+            )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
