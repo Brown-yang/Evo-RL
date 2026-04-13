@@ -197,3 +197,5 @@ corl_2026_template_submission/
 .pydeps/
 debug_images/
 eval_logs/
+ehpl/checkpoints/
+ehpl/pairs/
