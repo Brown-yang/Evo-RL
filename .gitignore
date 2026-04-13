@@ -195,6 +195,5 @@ AGENTS.md
 ### Project Specific ###
 corl_2026_template_submission/
 .pydeps/
-ehpl/
 debug_images/
 eval_logs/
