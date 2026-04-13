@@ -1,19 +1,15 @@
 {
   "dataset": {
-    "repo_id": "local/libero_10_no_noops_1.0.0_lerobot",
-    "root": "/mydata/LIBERO/libero_10_no_noops_1.0.0_lerobot"
+    "repo_id": "continuallearning/libero_10_image_task_0",
+    "root": "/mydata/LIBERO/libero_10_image_task_0"
   },
-  "output_dir": "outputs/train/pi05_lora_libero10",
-  "job_name": "pi05_lora_libero10",
+  "output_dir": "outputs/train/pi05_expert_libero10_task0",
+  "job_name": "pi05_expert_libero10_task0",
   "steps": 30000,
   "batch_size": 8,
   "num_workers": 1,
   "log_freq": 200,
   "save_freq": 5000,
-  "peft": {
-    "method_type": "LORA",
-    "r": 64
-  },
   "wandb": {
     "enable": false
   },
