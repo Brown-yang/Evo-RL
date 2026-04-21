@@ -37,7 +37,11 @@ TRAIN_CONFIG_NAME = "train_config.json"
 class EHPLConfig:
     enable: bool = False
     pairs_parquet: str | None = None
+    # SMPO temperature (pairwise preference strength).
     beta: float = 1.0
+    # If the pairs parquet contains a `margin` column (e.g. from `lerobot.ehpl.infer_judge`),
+    # keep only rows with margin >= this threshold to reduce noisy preference pairs.
+    min_pair_margin: float | None = None
     stats_json: str | None = None
     task_index_to_instruction_json: str | None = None
     hf_home: str | None = None
@@ -169,7 +173,9 @@ class TrainPipelineConfig(HubMixin):
         # EHPL validation
         if self.ehpl.enable:
             if not self.dataset.root:
-                raise ValueError("ehpl.enable=true requires `dataset.root` pointing to a v2.1 lerobot dataset.")
+                raise ValueError(
+                    "ehpl.enable=true requires `dataset.root` pointing to a local LeRobot dataset (v2.1 or v3.0)."
+                )
             if not self.ehpl.pairs_parquet:
                 raise ValueError("ehpl.enable=true requires `ehpl.pairs_parquet` (P2 pairs parquet path).")
             if self.policy.type not in ("pi0", "pi05"):

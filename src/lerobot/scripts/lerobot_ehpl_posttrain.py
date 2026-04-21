@@ -118,11 +118,17 @@ def main() -> None:
     ap.add_argument("--pretrained", type=str, required=True, help="SFT checkpoint path or HF repo id")
     ap.add_argument("--dataset_root", type=str, required=True)
     ap.add_argument("--pairs_parquet", type=str, required=True)
+    ap.add_argument(
+        "--min_pair_margin",
+        type=float,
+        default=None,
+        help="If pairs parquet has a `margin` column, keep only rows with margin >= this value.",
+    )
     ap.add_argument("--stats_json", type=str, default=None, help="Path to meta/stats.json (v2.1)")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2.5e-05)
-    ap.add_argument("--beta", type=float, default=1.0, help="Preference temperature beta_DPO")
+    ap.add_argument("--beta", type=float, default=1.0, help="SMPO temperature beta (pairwise preference strength)")
     ap.add_argument("--save_dir", type=str, default="/mydata/Evo-RL/ehpl/checkpoints/ehpl_posttrain_debug")
     ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
@@ -204,6 +210,7 @@ def main() -> None:
         dataset_root=dataset_root,
         pairs_parquet=args.pairs_parquet,
         task_index_to_instruction=None,
+        min_pair_margin=args.min_pair_margin,
     )
 
     def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:

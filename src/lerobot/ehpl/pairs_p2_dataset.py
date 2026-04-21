@@ -77,11 +77,13 @@ class EhplPairsP2Dataset(Dataset):
         pairs_parquet: str,
         task_index_to_instruction: dict[int, str] | None = None,
         device: str | None = None,
+        min_pair_margin: float | None = None,
     ) -> None:
         super().__init__()
         self.dataset_root = str(dataset_root)
         self.pairs_parquet = str(pairs_parquet)
         self.device = device
+        self.min_pair_margin = min_pair_margin
 
         info_path = Path(dataset_root) / "meta" / "info.json"
         if not info_path.exists():
@@ -142,6 +144,23 @@ class EhplPairsP2Dataset(Dataset):
             raise ValueError("pairs parquet has non-constant h_seg; keep fixed per run.")
         if not (self.pairs["act_dim"].astype(int) == self.act_dim).all():
             raise ValueError("pairs parquet has non-constant act_dim; keep fixed per run.")
+
+        if self.min_pair_margin is not None:
+            if "margin" not in self.pairs.columns:
+                raise ValueError(
+                    "min_pair_margin is set but pairs parquet has no 'margin' column. "
+                    "Run `python -m lerobot.ehpl.infer_judge ...` to add score_w/score_l/margin first."
+                )
+            n0 = int(len(self.pairs))
+            self.pairs = self.pairs[self.pairs["margin"].astype(float) >= float(self.min_pair_margin)].reset_index(
+                drop=True
+            )
+            logger.info(
+                "Filtered pairs by margin>=%s: %d -> %d rows",
+                self.min_pair_margin,
+                n0,
+                int(len(self.pairs)),
+            )
 
     # ------------------------------------------------------------------ #
     # v2.1 init — per-episode parquet + mp4 videos

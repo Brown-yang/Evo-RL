@@ -178,12 +178,14 @@ class EhplPreferenceTrainDataset(Dataset):
         pairs_parquet: str,
         stats_json: str,
         task_index_to_instruction_json: str | None = None,
+        min_pair_margin: float | None = None,
     ) -> None:
         super().__init__()
         self._inner = EhplPairsP2Dataset(
             dataset_root=dataset_root,
             pairs_parquet=pairs_parquet,
             task_index_to_instruction=_load_task_index_map(task_index_to_instruction_json),
+            min_pair_margin=min_pair_margin,
         )
         # `make_policy` needs `dataset.meta.features` (v2.1 `info.json`); stats come from `meta/stats.json`.
         self.meta = SimpleNamespace(
@@ -231,7 +233,16 @@ def update_policy_ehpl(
     lr_scheduler=None,
     lock=None,
 ) -> tuple[MetricsTracker, dict[str, Any]]:
-    """Preference ranking step: softplus(beta * (loss_w - loss_l))."""
+    """SMPO step (SkillMargin Preference Optimization).
+
+    We optimize the policy to prefer the winner chunk over the loser chunk using
+    a smooth pairwise surrogate:
+
+      loss = softplus(beta * (loss_w - loss_l))
+
+    where `loss_w/loss_l` are per-sample policy losses (NLL-like) for the two
+    candidate skill chunks under the same context `c`.
+    """
     from contextlib import nullcontext
 
     start_time = time.perf_counter()
@@ -298,9 +309,9 @@ def update_policy_ehpl(
     train_metrics.update_s = time.perf_counter() - start_time
 
     output_dict = {
-        "ehpl_loss_w_mean": loss_w.mean().item(),
-        "ehpl_loss_l_mean": loss_l.mean().item(),
-        "ehpl_delta_mean": delta.mean().item(),
+        "smpo_loss_w_mean": loss_w.mean().item(),
+        "smpo_loss_l_mean": loss_l.mean().item(),
+        "smpo_delta_mean": delta.mean().item(),
     }
     return train_metrics, output_dict
 
@@ -309,7 +320,9 @@ def make_ehpl_train_dataset(cfg: Any) -> EhplPreferenceTrainDataset:
     """Build EHPL dataset from `TrainPipelineConfig` (requires `dataset.root` + `ehpl.pairs_parquet`)."""
     root = cfg.dataset.root
     if not root:
-        raise ValueError("ehpl.enable=true requires `dataset.root` pointing to a v2.1 lerobot dataset.")
+        raise ValueError(
+            "ehpl.enable=true requires `dataset.root` pointing to a local LeRobot dataset (v2.1 or v3.0)."
+        )
     if not cfg.ehpl.pairs_parquet:
         raise ValueError("ehpl.enable=true requires `ehpl.pairs_parquet` (P2 pairs parquet path).")
     stats_json = cfg.ehpl.stats_json or str(Path(root) / "meta" / "stats.json")
@@ -318,4 +331,5 @@ def make_ehpl_train_dataset(cfg: Any) -> EhplPreferenceTrainDataset:
         pairs_parquet=str(cfg.ehpl.pairs_parquet),
         stats_json=stats_json,
         task_index_to_instruction_json=cfg.ehpl.task_index_to_instruction_json,
+        min_pair_margin=cfg.ehpl.min_pair_margin,
     )

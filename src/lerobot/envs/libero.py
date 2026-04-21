@@ -224,7 +224,7 @@ class LiberoEnv(gym.Env):
     def render(self):
         raw_obs = self._env.env._get_observations()
         image = self._format_raw_obs(raw_obs)["pixels"]["image"]
-        image = image[::-1]  # flip H only (vertical) for MuJoCo coordinate convention
+        image = image[::-1, ::-1]  # flip H only (vertical) for MuJoCo coordinate convention
         return image
 
     def _make_envs_task(self, task_suite: Any, task_id: int = 0):

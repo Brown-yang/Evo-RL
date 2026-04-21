@@ -1,0 +1,10 @@
+pairs_path=/mydata/Evo-RL/ehpl/pairs/libero10_p2_full/pairs.parquet
+episode_index=0
+frame_index=0
+T=32
+action_dim=7
+j_w=-0.6218471176180174
+j_l=-0.6451259416717221
+margin=0.02327882405370474
+agent_image=/mydata/Evo-RL/ehpl/_vis_example/ep0_f0_agent.png
+wrist_image=/mydata/Evo-RL/ehpl/_vis_example/ep0_f0_wrist.png
