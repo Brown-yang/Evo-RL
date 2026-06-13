@@ -14,11 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build EHPL P2 preference pairs from a lerobot dataset (v2.1 or v3.0).
+"""Build EHPL same-start candidates (P2) from a lerobot dataset (v2.1 or v3.0).
 
 Reads episode data, segments trajectories at skill boundaries
 (gripper events + change-point detection), then constructs preference pairs
 by comparing expert segments against perturbed candidates.
+
+Paper-aligned pipeline:
+  same-start generate K candidates -> train judge from episode success ->
+  score candidates -> select winner/loser + margin filter.
+
+This script implements only the first step: **candidate generation**.
+Use `train_judge.py` and `select_pairs_from_candidates.py` for the rest.
 """
 
 from __future__ import annotations
@@ -196,42 +203,36 @@ def _perturb_actions(
     return v
 
 
-def _score_candidate(
-    u: np.ndarray,
-    mask: np.ndarray,
-    state: np.ndarray,
-    t0: int,
-    cfg: P2Config,
-) -> float:
-    """Offline proxy score J_k(u). Higher is better."""
-    valid = mask.astype(bool)
-    if valid.sum() <= 1:
-        return -1000000000.0
-
-    u_valid = u[valid]
-
-    # Smoothness: penalize large action differences
-    du = np.diff(u_valid[:, :6], axis=0)
-    smooth = -float(np.mean(du ** 2))
-
-    # Energy: penalize large actions
-    energy = -float(np.mean(u_valid[:, :6] ** 2))
-
-    # State stability within the window
-    t1 = min(t0 + int(valid.sum()), state.shape[0])
-    s_win = state[t0:t1]
-    if len(s_win) > 1:
-        ds = np.diff(s_win[:, :6], axis=0)
-        stab = -float(np.mean(ds ** 2))
-    else:
-        stab = 0.0
-
-    return smooth * 1.0 + energy * 0.5 + stab * 0.5
-
-
 def _flatten_actions(u: np.ndarray) -> list[float]:
     """Flatten action array to a list of floats."""
     return u.astype(np.float32).reshape(-1).tolist()
+
+
+def _maybe_append_candidate_rows(
+    *,
+    rows: list[dict[str, Any]],
+    candidates: list[np.ndarray],
+    mask: np.ndarray,
+    cfg: P2Config,
+    episode_index: int,
+    frame_index: int,
+    task_index: int,
+    segment_start_index_abs: int,
+) -> None:
+    for i, u in enumerate(candidates):
+        rows.append(
+            {
+                "segment_start_index": int(segment_start_index_abs),
+                "episode_index": int(episode_index),
+                "frame_index": int(frame_index),
+                "task_index": int(task_index),
+                "h_seg": int(cfg.h_seg),
+                "act_dim": int(cfg.act_dim),
+                "candidate_index": int(i),
+                "action": _flatten_actions(u),
+                "action_mask": mask.astype(np.uint8).tolist(),
+            }
+        )
 
 
 def build_pairs_for_dataset(
@@ -241,7 +242,7 @@ def build_pairs_for_dataset(
     episode_start: int = 0,
     episode_end_exclusive: int | None = None,
 ) -> None:
-    """Build preference pairs from a lerobot dataset (v2.1 or v3.0)."""
+    """Build same-start candidates from a lerobot dataset (v2.1 or v3.0)."""
     rng = np.random.default_rng(cfg.seed)
 
     # Determine episode range
@@ -280,29 +281,17 @@ def build_pairs_for_dataset(
             for _ in range(max(cfg.n_candidates - 1, 1)):
                 candidates.append(_perturb_actions(u_expert, mask, cfg, rng))
 
-            # Score candidates
-            scores = [_score_candidate(u, mask, ep["state"], t0, cfg) for u in candidates]
-
-            # Best = winner, worst = loser
-            w = int(np.argmax(scores))
-            l = int(np.argmin(scores))
-            u_w = candidates[w]
-            u_l = candidates[l]
-
-            row = {
-                "segment_start_index": idx_abs + t0,
-                "episode_index": ep["episode_index"],
-                "frame_index": ep["frame_index"][t0],
-                "task_index": ep["task_index"],
-                "h_seg": cfg.h_seg,
-                "act_dim": cfg.act_dim,
-                "action_w": _flatten_actions(u_w),
-                "action_l": _flatten_actions(u_l),
-                "action_mask": mask.astype(np.uint8).tolist(),
-                "j_w": float(scores[w]),
-                "j_l": float(scores[l]),
-            }
-            rows.append(row)
+            segment_start_index_abs = idx_abs + t0
+            _maybe_append_candidate_rows(
+                rows=rows,
+                candidates=candidates,
+                mask=mask,
+                cfg=cfg,
+                episode_index=int(ep["episode_index"]),
+                frame_index=int(ep["frame_index"][t0]),
+                task_index=int(ep["task_index"]),
+                segment_start_index_abs=int(segment_start_index_abs),
+            )
 
     if not rows:
         raise RuntimeError("No preference rows produced. Check thresholds or dataset paths.")

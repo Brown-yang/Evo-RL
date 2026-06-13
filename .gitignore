@@ -166,6 +166,9 @@ wandb/
 # Data folders
 data/
 outputs/
+eval_logs/*
+!eval_logs/videos/
+!eval_logs/videos/**/*.mp4
 
 # Translations
 *.mo
@@ -196,6 +199,10 @@ AGENTS.md
 corl_2026_template_submission/
 .pydeps/
 debug_images/
-eval_logs/
 ehpl/checkpoints/
 ehpl/pairs/
+
+### Local Secrets ###
+.ssh
+.ssh.pub
+.ssh/

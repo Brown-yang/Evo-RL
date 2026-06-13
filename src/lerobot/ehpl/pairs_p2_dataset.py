@@ -149,7 +149,7 @@ class EhplPairsP2Dataset(Dataset):
             if "margin" not in self.pairs.columns:
                 raise ValueError(
                     "min_pair_margin is set but pairs parquet has no 'margin' column. "
-                    "Run `python -m lerobot.ehpl.infer_judge ...` to add score_w/score_l/margin first."
+                    "Run `python -m lerobot.ehpl.select_pairs_from_candidates ...` to write a pairs parquet with margin first."
                 )
             n0 = int(len(self.pairs))
             self.pairs = self.pairs[self.pairs["margin"].astype(float) >= float(self.min_pair_margin)].reset_index(

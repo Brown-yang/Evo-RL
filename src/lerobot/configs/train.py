@@ -39,7 +39,7 @@ class EHPLConfig:
     pairs_parquet: str | None = None
     # SMPO temperature (pairwise preference strength).
     beta: float = 1.0
-    # If the pairs parquet contains a `margin` column (e.g. from `lerobot.ehpl.infer_judge`),
+    # If the pairs parquet contains a `margin` column (e.g. from `lerobot.ehpl.select_pairs_from_candidates`),
     # keep only rows with margin >= this threshold to reduce noisy preference pairs.
     min_pair_margin: float | None = None
     stats_json: str | None = None

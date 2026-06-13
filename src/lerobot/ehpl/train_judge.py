@@ -1,39 +1,23 @@
 #!/usr/bin/env python
 """
-Train a Segment-level Advantage Judge on skill-level preference pairs.
+Train a Segment-level Advantage Judge for EHPL (paper-aligned).
 
-Data format (parquet):
-  - context: 1D vector, shape [context_dim]
-  - action_w: winner action chunk, shape [T, action_dim] (or flattened [T*action_dim])
-  - action_l: loser action chunk, shape [T, action_dim] (or flattened [T*action_dim])
-  - success (optional): 0/1 (episode-level or segment-level)
+Inputs:
+  - candidates parquet produced by `build_pairs_p2.py`
+  - `dataset_root` to load (image, task) at the segment start
+  - label is episode-level `episode_success` ('success'/'failure') -> y in {0,1}
 
 Objective:
   A(c,u) = Q(c,u) - V(c)
 
 Loss:
-  1) Pairwise ranking loss:
-       L_rank = -logsigmoid(A_w - A_l)
-  2) Value loss (optional if success exists):
-       L_value = (V(c) - success)^2
-  3) Total:
-       L = λ1 * L_rank + λ2 * L_value
-
-Usage example:
-  python -m lerobot.ehpl.train_judge \\
-    --parquet /path/to/pairs.parquet \\
-    --context_key context \\
-    --action_w_key action_w \\
-    --action_l_key action_l \\
-    --success_key success \\
-    --batch_size 256 --lr 3e-4 --epochs 5 --device cuda
+  BCEWithLogits(A(c,u), y)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -41,80 +25,18 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import Tensor
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from lerobot.ehpl.modeling_ehpl import AdvantageJudge, AdvantageJudgeConfig
-from lerobot.ehpl.processor_ehpl import SkillPreferenceDataset, skill_preference_collate_fn
-
-
-@torch.no_grad()
-def evaluate(
-    model: AdvantageJudge,
-    loader: DataLoader,
-    device: torch.device,
-    *,
-    lambda_rank: float,
-    lambda_value: float,
-    use_value_loss: bool,
-) -> dict[str, float]:
-    model.eval()
-    losses = []
-    rank_losses = []
-    value_losses = []
-    correct = 0
-    total = 0
-    for batch in loader:
-        context = batch["context"].to(device)
-        aw = batch["action_w"].to(device)
-        al = batch["action_l"].to(device)
-
-        out_w = model(context, aw)
-        out_l = model(context, al)
-
-        a_w = out_w["A"]
-        a_l = out_l["A"]
-
-        rank_loss = -F.logsigmoid(a_w - a_l).mean()
-        loss = lambda_rank * rank_loss
-
-        value_loss = torch.tensor(0.0, device=device)
-        if use_value_loss and "success" in batch:
-            success = batch["success"].to(device)
-            mask = torch.isfinite(success)
-            if mask.any():
-                # V is same for w/l because only depends on context; take from out_w
-                v = out_w["V"]
-                value_loss = F.mse_loss(v[mask], success[mask])
-                loss = loss + lambda_value * value_loss
-
-        losses.append(loss.detach().item())
-        rank_losses.append(rank_loss.detach().item())
-        value_losses.append(value_loss.detach().item())
-
-        correct += int(((a_w - a_l) > 0).sum().item())
-        total += int(a_w.numel())
-
-    return {
-        "loss": float(np.mean(losses)) if losses else math.nan,
-        "rank_loss": float(np.mean(rank_losses)) if rank_losses else math.nan,
-        "value_loss": float(np.mean(value_losses)) if value_losses else math.nan,
-        "pair_acc": float(correct / max(total, 1)),
-    }
+from lerobot.ehpl.candidates_p2_dataset import EhplCandidatesP2Dataset
+from lerobot.ehpl.configuration_ehpl import EhplScoringConfig
+from lerobot.ehpl.modeling_ehpl import AdvantageJudge, AdvantageJudgeConfig, EhplFrozenContextEncoder
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--parquet", type=str, required=True, help="Path to parquet file.")
-    p.add_argument("--context_key", type=str, default="context")
-    p.add_argument("--action_w_key", type=str, default="action_w")
-    p.add_argument("--action_l_key", type=str, default="action_l")
-    p.add_argument("--success_key", type=str, default=None, help="Optional success field (0/1).")
-
-    p.add_argument("--context_dim", type=int, default=None, help="If None, infer from data.")
-    p.add_argument("--T", type=int, default=None, help="Action chunk length. Required if actions are flattened.")
-    p.add_argument("--action_dim", type=int, default=None, help="Action dimension. Required if actions are flattened.")
+    p.add_argument("--dataset_root", type=str, required=True)
+    p.add_argument("--parquet", type=str, required=True, help="Candidates parquet from build_pairs_p2.py")
 
     p.add_argument("--action_encoder", type=str, default="mlp_pool", choices=["mlp_pool", "transformer"])
     p.add_argument("--batch_size", type=int, default=256)
@@ -122,10 +44,6 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
-
-    p.add_argument("--lambda_rank", type=float, default=1.0)
-    p.add_argument("--lambda_value", type=float, default=0.5)
-    p.add_argument("--no_value_loss", action="store_true", help="Disable value loss even if success exists.")
 
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--num_workers", type=int, default=2)
@@ -142,18 +60,9 @@ def main() -> None:
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    ds = SkillPreferenceDataset(
-        args.parquet,
-        context_key=args.context_key,
-        action_w_key=args.action_w_key,
-        action_l_key=args.action_l_key,
-        success_key=args.success_key,
-        action_dim=args.action_dim,
-        fixed_T=args.T,
-        max_rows=args.max_rows,
-    )
-    if args.context_dim is not None and int(args.context_dim) != int(ds.context_dim):
-        raise ValueError(f"context_dim mismatch: expected {args.context_dim}, got {ds.context_dim}")
+    ds = EhplCandidatesP2Dataset(dataset_root=args.dataset_root, candidates_parquet=args.parquet)
+    context_encoder = EhplFrozenContextEncoder(EhplScoringConfig())
+    scoring_cfg = context_encoder.cfg
 
     # Split train/val
     n_val = int(round(len(ds) * float(args.val_frac)))
@@ -161,13 +70,24 @@ def main() -> None:
     n_train = len(ds) - n_val
     train_ds, val_ds = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed))
 
+    def _collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k in batch[0].keys():
+            if k == "task":
+                out[k] = [b[k] for b in batch]
+            elif torch.is_tensor(batch[0][k]):
+                out[k] = torch.stack([b[k] for b in batch], dim=0)
+            else:
+                out[k] = [b[k] for b in batch]
+        return out
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=skill_preference_collate_fn,
+        collate_fn=_collate,
         drop_last=False,
     )
     val_loader = (
@@ -177,7 +97,7 @@ def main() -> None:
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
-            collate_fn=skill_preference_collate_fn,
+            collate_fn=_collate,
             drop_last=False,
         )
         if n_val > 0
@@ -185,41 +105,32 @@ def main() -> None:
     )
 
     cfg = AdvantageJudgeConfig(
-        context_dim=ds.context_dim,
-        action_dim=ds.action_dim,
+        context_dim=scoring_cfg.context_dim,
+        action_dim=int(getattr(ds, "act_dim", 7)),
         action_encoder=args.action_encoder,  # type: ignore[arg-type]
     )
     model = AdvantageJudge(cfg).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    use_value_loss = (not args.no_value_loss) and (args.success_key is not None)
-
     # Save training config for reproducibility
     (save_dir / "train_config.json").write_text(
         json.dumps(
             {
                 "parquet": args.parquet,
-                "keys": {
-                    "context": args.context_key,
-                    "action_w": args.action_w_key,
-                    "action_l": args.action_l_key,
-                    "success": args.success_key,
-                },
+                "dataset_root": args.dataset_root,
                 "dataset": {
-                    "context_dim": ds.context_dim,
+                    "context_dim": getattr(ds, "context_dim", None),
                     "fixed_T": getattr(ds, "fixed_T", None),
                     "action_dim": getattr(ds, "action_dim", None),
                     "n": len(ds),
                 },
                 "model": asdict(cfg),
+                "scoring": asdict(scoring_cfg) if scoring_cfg is not None else None,
                 "train": {
                     "batch_size": args.batch_size,
                     "lr": args.lr,
                     "epochs": args.epochs,
-                    "lambda_rank": args.lambda_rank,
-                    "lambda_value": args.lambda_value,
-                    "use_value_loss": use_value_loss,
                     "val_frac": args.val_frac,
                     "seed": args.seed,
                 },
@@ -233,26 +144,31 @@ def main() -> None:
         model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}", leave=True)
         for batch in pbar:
-            context = batch["context"].to(device, non_blocking=True)
-            aw = batch["action_w"].to(device, non_blocking=True)
-            al = batch["action_l"].to(device, non_blocking=True)
+            # Images: use the main camera key used by EhplFrozenContextEncoder (first valid cam)
+            img = batch.get("observation.images.image")
+            if img is None:
+                raise ValueError(
+                    "Missing `observation.images.image` in dataset. "
+                    "Ensure your dataset has videos (v2.1) or inline images (v3.0)."
+                )
+            images = img.to(device, non_blocking=True).unsqueeze(1)  # [B,1,C,H,W]
+            image_attention_mask = torch.ones(images.shape[0], 1, device=images.device, dtype=torch.bool)
+            text = batch["task"]
+            with torch.no_grad():
+                context = context_encoder(images=images, image_attention_mask=image_attention_mask, text=text)
+            context = context.to(device)
 
-            out_w = model(context, aw)
-            out_l = model(context, al)
-            a_w = out_w["A"]
-            a_l = out_l["A"]
+            action = batch["action"].to(device, non_blocking=True)
+            out = model(context, action)
+            a = out["A"]
 
-            rank_loss = -F.logsigmoid(a_w - a_l).mean()
-            loss = float(args.lambda_rank) * rank_loss
-
-            value_loss = torch.tensor(0.0, device=device)
-            if use_value_loss and "success" in batch:
-                success = batch["success"].to(device, non_blocking=True)
-                mask = torch.isfinite(success)
-                if mask.any():
-                    v = out_w["V"]  # [B]
-                    value_loss = F.mse_loss(v[mask], success[mask])
-                    loss = loss + float(args.lambda_value) * value_loss
+            if "success" not in batch:
+                continue
+            y = batch["success"].to(device, non_blocking=True)
+            mask = torch.isfinite(y)
+            if not bool(mask.any()):
+                continue
+            loss = F.binary_cross_entropy_with_logits(a[mask], y[mask])
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -262,27 +178,35 @@ def main() -> None:
             pbar.set_postfix(
                 {
                     "loss": f"{loss.detach().item():.4f}",
-                    "rank": f"{rank_loss.detach().item():.4f}",
-                    "v": f"{value_loss.detach().item():.4f}",
                 }
             )
 
         # Validation
         val_metrics = None
         if val_loader is not None:
-            val_metrics = evaluate(
-                model,
-                val_loader,
-                device,
-                lambda_rank=float(args.lambda_rank),
-                lambda_value=float(args.lambda_value),
-                use_value_loss=use_value_loss,
-            )
-            print(
-                f"[val] epoch={epoch} loss={val_metrics['loss']:.4f} "
-                f"rank={val_metrics['rank_loss']:.4f} value={val_metrics['value_loss']:.4f} "
-                f"pair_acc={val_metrics['pair_acc']*100:.1f}%"
-            )
+            model.eval()
+            losses = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    img = batch.get("observation.images.image")
+                    if img is None:
+                        continue
+                    images = img.to(device, non_blocking=True).unsqueeze(1)
+                    image_attention_mask = torch.ones(images.shape[0], 1, device=images.device, dtype=torch.bool)
+                    text = batch["task"]
+                    context = context_encoder(images=images, image_attention_mask=image_attention_mask, text=text).to(device)
+                    action = batch["action"].to(device, non_blocking=True)
+                    out = model(context, action)
+                    a = out["A"]
+                    if "success" not in batch:
+                        continue
+                    y = batch["success"].to(device, non_blocking=True)
+                    m = torch.isfinite(y)
+                    if not bool(m.any()):
+                        continue
+                    losses.append(F.binary_cross_entropy_with_logits(a[m], y[m]).detach().item())
+            val_metrics = {"loss": float(np.mean(losses)) if losses else float("nan")}
+            print(f"[val] epoch={epoch} loss={val_metrics['loss']:.4f}")
 
         # Save checkpoint
         if epoch % int(args.save_every) == 0 or epoch == args.epochs:
@@ -292,8 +216,9 @@ def main() -> None:
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "model_config": asdict(cfg),
+                "scoring_config": asdict(scoring_cfg) if scoring_cfg is not None else None,
                 "dataset": {
-                    "context_dim": ds.context_dim,
+                    "context_dim": getattr(ds, "context_dim", None),
                     "fixed_T": getattr(ds, "fixed_T", None),
                     "action_dim": getattr(ds, "action_dim", None),
                 },
